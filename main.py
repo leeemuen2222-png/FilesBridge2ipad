@@ -2,22 +2,21 @@
 import sys
 import time
 import ctypes
-import asyncio
 import threading
+import asyncio
+import subprocess
+import tempfile
+import shutil
+import os
 from pathlib import Path
-from typing import Optional
-from ctypes import wintypes
+from datetime import datetime
+from tkinter import Tk, Canvas, Button, filedialog, messagebox
 
-from PySide6.QtCore import Qt, QPoint, QTimer, Signal, QObject
-from PySide6.QtGui import QPainter, QColor
-from PySide6.QtWidgets import (
-    QApplication,
-    QWidget,
-    QPushButton,
-    QVBoxLayout,
-    QMessageBox,
-    QFileDialog,
-)
+APP_NAME = "FilesBridge2ipad"
+
+# -----------------------------------------------------------------------------
+# Optional BLE support
+# -----------------------------------------------------------------------------
 
 try:
     from bleak import BleakScanner, BleakClient
@@ -27,361 +26,566 @@ except Exception as exc:
     BLE_AVAILABLE = False
     BLE_IMPORT_ERROR = str(exc)
 
+FILES_BRIDGE_SERVICE_UUID = "7f7d0001-5a10-4c91-9b1a-6ab31d8a1001"
 
-APP_NAME = "FilesBridge2ipad"
 
 # -----------------------------------------------------------------------------
 # Win32 helpers
 # -----------------------------------------------------------------------------
 
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 
 GetForegroundWindow = user32.GetForegroundWindow
-GetForegroundWindow.restype = wintypes.HWND
-
 SetForegroundWindow = user32.SetForegroundWindow
-SetForegroundWindow.argtypes = [wintypes.HWND]
-SetForegroundWindow.restype = wintypes.BOOL
-
-keybd_event = user32.keybd_event
 
 VK_CONTROL = 0x11
-VK_P = 0x50
+VK_L = 0x4C
+VK_C = 0x43
+VK_ESCAPE = 0x1B
 KEYEVENTF_KEYUP = 0x0002
 
 
-def press_ctrl_p():
-    keybd_event(VK_CONTROL, 0, 0, 0)
-    keybd_event(VK_P, 0, 0, 0)
-    keybd_event(VK_P, 0, KEYEVENTF_KEYUP, 0)
-    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+def key_down(vk):
+    user32.keybd_event(vk, 0, 0, 0)
+
+
+def key_up(vk):
+    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+
+def press_combo(modifier, key):
+    key_down(modifier)
+    key_down(key)
+    key_up(key)
+    key_up(modifier)
+
+
+def press_key(key):
+    key_down(key)
+    key_up(key)
+
+
+def get_clipboard_text(root):
+    try:
+        return root.clipboard_get()
+    except Exception:
+        return ""
 
 
 # -----------------------------------------------------------------------------
-# BLE protocol reserved for future iPad receiver
+# Browser detection
 # -----------------------------------------------------------------------------
 
-FILES_BRIDGE_SERVICE_UUID = "7f7d0001-5a10-4c91-9b1a-6ab31d8a1001"
+def find_browser_executable():
+    candidates = []
+
+    local = os.environ.get("LOCALAPPDATA", "")
+    program_files = os.environ.get("PROGRAMFILES", "")
+    program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "")
+
+    if local:
+        candidates += [
+            Path(local) / "Google/Chrome/Application/chrome.exe",
+            Path(local) / "Microsoft/Edge/Application/msedge.exe",
+        ]
+
+    if program_files:
+        candidates += [
+            Path(program_files) / "Google/Chrome/Application/chrome.exe",
+            Path(program_files) / "Microsoft/Edge/Application/msedge.exe",
+        ]
+
+    if program_files_x86:
+        candidates += [
+            Path(program_files_x86) / "Google/Chrome/Application/chrome.exe",
+            Path(program_files_x86) / "Microsoft/Edge/Application/msedge.exe",
+        ]
+
+    for name in ("chrome.exe", "msedge.exe"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return None
 
 
-class BluetoothSignals(QObject):
-    status = Signal(str)
-    connected = Signal(str)
-    failed = Signal(str)
+# -----------------------------------------------------------------------------
+# Main floating orb
+# -----------------------------------------------------------------------------
 
+class FloatingBall:
+    SIZE = 180
+    BG_KEY = "#010203"
 
-class BluetoothManager:
     def __init__(self):
-        self.signals = BluetoothSignals()
-        self.client = None
-        self.device = None
-        self._thread = None
+        self.root = Tk()
+        self.root.title(APP_NAME)
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
 
-    @property
-    def is_connected(self):
+        self.root.configure(bg=self.BG_KEY)
         try:
-            return bool(self.client and self.client.is_connected)
+            self.root.wm_attributes("-transparentcolor", self.BG_KEY)
         except Exception:
+            pass
+
+        self.root.geometry(f"{self.SIZE}x{self.SIZE}+1200+350")
+
+        self.canvas = Canvas(
+            self.root,
+            width=self.SIZE,
+            height=self.SIZE,
+            bg=self.BG_KEY,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.place(x=0, y=0)
+
+        self.canvas.create_oval(
+            5, 7,
+            self.SIZE - 5, self.SIZE - 3,
+            fill="#1f2125",
+            outline=""
+        )
+        self.canvas.create_oval(
+            17, 12,
+            self.SIZE - 28, self.SIZE - 45,
+            fill="#292c31",
+            outline=""
+        )
+
+        self.capture_btn = self.make_button(
+            "截取页面",
+            self.capture_page,
+            y=34
+        )
+
+        self.connect_btn = self.make_button(
+            "连接 iPad",
+            self.connect_ipad,
+            y=75
+        )
+
+        self.send_btn = self.make_button(
+            "发送文件",
+            self.choose_or_send_file,
+            y=116
+        )
+
+        self.pending_file = None
+        self.last_external_window = None
+        self.ble_client = None
+        self.ble_device = None
+        self.scanning = False
+        self.capture_running = False
+
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+        self.window_start_x = 0
+        self.window_start_y = 0
+
+        self.canvas.bind("<ButtonPress-1>", self.start_drag)
+        self.canvas.bind("<B1-Motion>", self.do_drag)
+        self.canvas.bind("<Button-3>", self.exit_app)
+
+        self.root.after(200, self.track_foreground_window)
+
+    def make_button(self, text, command, y):
+        btn = Button(
+            self.root,
+            text=text,
+            command=command,
+            relief="flat",
+            bd=0,
+            bg="#f3f3f3",
+            fg="#111111",
+            activebackground="#dddddd",
+            activeforeground="#111111",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            cursor="hand2",
+        )
+        btn.place(x=31, y=y, width=118, height=33)
+        return btn
+
+    # -------------------------------------------------------------------------
+    # Dragging
+    # -------------------------------------------------------------------------
+
+    def start_drag(self, event):
+        self.drag_start_x = event.x_root
+        self.drag_start_y = event.y_root
+        self.window_start_x = self.root.winfo_x()
+        self.window_start_y = self.root.winfo_y()
+
+    def do_drag(self, event):
+        dx = event.x_root - self.drag_start_x
+        dy = event.y_root - self.drag_start_y
+        self.root.geometry(
+            f"+{self.window_start_x + dx}+{self.window_start_y + dy}"
+        )
+
+    def exit_app(self, event=None):
+        if messagebox.askyesno(APP_NAME, "退出 FilesBridge2ipad？"):
+            self.root.destroy()
+
+    # -------------------------------------------------------------------------
+    # Foreground tracking
+    # -------------------------------------------------------------------------
+
+    def track_foreground_window(self):
+        try:
+            hwnd = GetForegroundWindow()
+            if self.root.focus_displayof() is None and hwnd:
+                self.last_external_window = hwnd
+        except Exception:
+            pass
+
+        self.root.after(200, self.track_foreground_window)
+
+    # -------------------------------------------------------------------------
+    # Automatic page -> PDF
+    # -------------------------------------------------------------------------
+
+    def capture_page(self):
+        if self.capture_running:
+            return
+
+        if not self.last_external_window:
+            messagebox.showwarning(
+                APP_NAME,
+                "没有找到刚才使用的浏览器窗口。"
+            )
+            return
+
+        browser = find_browser_executable()
+
+        if browser is None:
+            messagebox.showerror(
+                APP_NAME,
+                "没有找到 Chrome 或 Microsoft Edge。\n"
+                "当前版本需要其中一个 Chromium 浏览器来自动生成 PDF。"
+            )
+            return
+
+        self.capture_running = True
+        self.capture_btn.config(text="生成中…", state="disabled")
+
+        threading.Thread(
+            target=self._capture_worker,
+            args=(browser,),
+            daemon=True
+        ).start()
+
+    def _capture_worker(self, browser):
+        try:
+            target = self.last_external_window
+
+            # Temporarily hide the orb, restore browser focus, copy URL.
+            self.root.after(0, self.root.withdraw)
+            time.sleep(0.15)
+
+            SetForegroundWindow(target)
+            time.sleep(0.20)
+
+            # Ctrl+L -> Ctrl+C -> Esc
+            press_combo(VK_CONTROL, VK_L)
+            time.sleep(0.08)
+            press_combo(VK_CONTROL, VK_C)
+            time.sleep(0.12)
+            press_key(VK_ESCAPE)
+            time.sleep(0.08)
+
+            # Reading Tk clipboard must happen on Tk's thread.
+            url_box = {"value": ""}
+            done = threading.Event()
+
+            def read_clipboard():
+                try:
+                    url_box["value"] = get_clipboard_text(self.root).strip()
+                finally:
+                    done.set()
+
+            self.root.after(0, read_clipboard)
+            done.wait(timeout=2.0)
+
+            url = url_box["value"]
+
+            if not (
+                url.startswith("http://")
+                or url.startswith("https://")
+                or url.startswith("file://")
+            ):
+                raise RuntimeError(
+                    "无法读取当前浏览器页面的网址。\n"
+                    "请确保刚才正在使用 Chrome 或 Edge 的网页标签页。"
+                )
+
+            temp_dir = Path(tempfile.gettempdir()) / APP_NAME
+            temp_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pdf_path = temp_dir / f"WebPage_{timestamp}.pdf"
+
+            # Fully automatic PDF generation.
+            command = [
+                str(browser),
+                "--headless=new",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--run-all-compositor-stages-before-draw",
+                "--virtual-time-budget=5000",
+                "--print-to-pdf-no-header",
+                f"--print-to-pdf={pdf_path}",
+                url,
+            ]
+
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=45,
+                creationflags=creationflags,
+            )
+
+            if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+                err = (result.stderr or result.stdout or "").strip()
+                if len(err) > 600:
+                    err = err[-600:]
+
+                raise RuntimeError(
+                    "浏览器没有成功生成 PDF。"
+                    + (("\n\n" + err) if err else "")
+                )
+
+            self.pending_file = pdf_path
+
+            self.root.after(
+                0,
+                lambda: self._capture_success(pdf_path)
+            )
+
+        except Exception as exc:
+            msg = str(exc)
+            self.root.after(
+                0,
+                lambda: self._capture_failed(msg)
+            )
+
+    def _capture_success(self, pdf_path):
+        self.capture_running = False
+        self.capture_btn.config(text="截取页面", state="normal")
+
+        self.root.deiconify()
+        self.root.attributes("-topmost", True)
+
+        answer = messagebox.askyesno(
+            "页面已生成",
+            "PDF 已自动创建：\n\n{}\n\n"
+            "是否现在发送到 iPad？".format(pdf_path.name)
+        )
+
+        if answer:
+            self.send_pending_file()
+        else:
+            messagebox.showinfo(
+                APP_NAME,
+                "PDF 已保留为当前待发送文件。\n\n"
+                "之后点击“发送文件”即可发送。"
+            )
+
+    def _capture_failed(self, message):
+        self.capture_running = False
+        self.capture_btn.config(text="截取页面", state="normal")
+
+        self.root.deiconify()
+        self.root.attributes("-topmost", True)
+
+        messagebox.showerror(
+            "页面生成失败",
+            message
+        )
+
+    # -------------------------------------------------------------------------
+    # File selection
+    # -------------------------------------------------------------------------
+
+    def choose_file(self):
+        path = filedialog.askopenfilename(
+            title="选择要发送到 iPad 的文件",
+            filetypes=[("所有文件", "*.*")]
+        )
+
+        if not path:
             return False
 
-    def scan_and_connect(self):
+        self.pending_file = Path(path)
+        return True
+
+    # -------------------------------------------------------------------------
+    # BLE
+    # -------------------------------------------------------------------------
+
+    def connect_ipad(self):
+        if self.scanning:
+            return
+
+        if self.ble_client is not None:
+            try:
+                if self.ble_client.is_connected:
+                    messagebox.showinfo(APP_NAME, "iPad 已连接。")
+                    return
+            except Exception:
+                pass
+
         if not BLE_AVAILABLE:
-            message = "Bluetooth 组件 bleak 无法加载。"
-            if BLE_IMPORT_ERROR:
-                message += "\n\n错误信息：\n" + BLE_IMPORT_ERROR
-            self.signals.failed.emit(message)
+            messagebox.showinfo(
+                "连接 iPad",
+                "当前未安装蓝牙组件 bleak。\n\n"
+                "以后启用 iPad 接收端时运行：\n"
+                "python -m pip install bleak"
+            )
             return
 
-        if self._thread and self._thread.is_alive():
-            return
+        self.scanning = True
+        self.connect_btn.config(text="搜索中…", state="disabled")
 
-        self._thread = threading.Thread(
-            target=self._thread_entry,
-            daemon=True,
-        )
-        self._thread.start()
+        threading.Thread(
+            target=self._ble_thread,
+            daemon=True
+        ).start()
 
-    def _thread_entry(self):
+    def _ble_thread(self):
         try:
-            asyncio.run(self._scan_and_connect_async())
+            asyncio.run(self._scan_ble())
         except Exception as exc:
-            self.signals.failed.emit("蓝牙连接失败：{}".format(exc))
+            self.root.after(
+                0,
+                lambda: self._ble_failed("蓝牙连接失败：{}".format(exc))
+            )
 
-    async def _scan_and_connect_async(self):
-        self.signals.status.emit("搜索 iPad…")
-
-        found = await BleakScanner.discover(timeout=6.0, return_adv=True)
+    async def _scan_ble(self):
+        found = await BleakScanner.discover(
+            timeout=6.0,
+            return_adv=True
+        )
 
         target_device = None
+
         for _address, item in found.items():
             device, adv = item
             uuids = [u.lower() for u in (adv.service_uuids or [])]
+
             if FILES_BRIDGE_SERVICE_UUID.lower() in uuids:
                 target_device = device
                 break
 
         if target_device is None:
-            self.signals.failed.emit(
-                "未找到 FilesBridge2ipad 接收端。\n\n"
-                "目前还没有 iPad 端 App，因此这是正常结果。"
+            self.root.after(
+                0,
+                lambda: self._ble_failed(
+                    "未找到 FilesBridge2ipad iPad 接收端。\n\n"
+                    "目前尚未制作 iPad 端，因此这是正常结果。"
+                )
             )
             return
-
-        self.signals.status.emit("正在连接…")
 
         client = BleakClient(target_device)
         await client.connect(timeout=10.0)
 
         if not client.is_connected:
-            self.signals.failed.emit("发现接收端，但连接失败。")
-            return
-
-        self.client = client
-        self.device = target_device
-        self.signals.connected.emit(target_device.name or "iPad")
-
-
-class FloatingBall(QWidget):
-    SIZE = 178
-
-    def __init__(self):
-        super().__init__()
-
-        self.last_external_window = None
-        self.drag_origin = QPoint()
-        self.window_origin = QPoint()
-        self.dragging = False
-        self.pending_file = None  # type: Optional[Path]
-
-        self.bluetooth = BluetoothManager()
-        self.bluetooth.signals.status.connect(self.on_bt_status)
-        self.bluetooth.signals.connected.connect(self.on_bt_connected)
-        self.bluetooth.signals.failed.connect(self.on_bt_failed)
-
-        self.setFixedSize(self.SIZE, self.SIZE)
-        self.setWindowTitle(APP_NAME)
-        self.setAcceptDrops(True)
-
-        self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-
-        self.capture_btn = QPushButton("截取页面")
-        self.connect_btn = QPushButton("连接 iPad")
-        self.send_btn = QPushButton("发送文件")
-
-        for button in (self.capture_btn, self.connect_btn, self.send_btn):
-            button.setCursor(Qt.PointingHandCursor)
-            button.setFixedHeight(35)
-            button.setStyleSheet("""
-                QPushButton {
-                    background: rgba(255,255,255,230);
-                    color: #171717;
-                    border: 0px;
-                    border-radius: 15px;
-                    font-size: 14px;
-                    font-weight: 600;
-                    padding: 0 12px;
-                }
-                QPushButton:hover {
-                    background: rgba(255,255,255,250);
-                }
-                QPushButton:pressed {
-                    background: rgba(220,220,220,250);
-                }
-            """)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 23, 26, 23)
-        layout.setSpacing(7)
-        layout.addStretch(1)
-        layout.addWidget(self.capture_btn)
-        layout.addWidget(self.connect_btn)
-        layout.addWidget(self.send_btn)
-        layout.addStretch(1)
-
-        self.capture_btn.clicked.connect(self.capture_page)
-        self.connect_btn.clicked.connect(self.connect_ipad)
-        self.send_btn.clicked.connect(self.choose_or_send_file)
-
-        self.foreground_timer = QTimer(self)
-        self.foreground_timer.timeout.connect(self.remember_foreground_window)
-        self.foreground_timer.start(150)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
-
-        painter.setBrush(QColor(0, 0, 0, 48))
-        painter.drawEllipse(6, 8, self.SIZE - 12, self.SIZE - 12)
-
-        painter.setBrush(QColor(30, 32, 36, 239))
-        painter.drawEllipse(2, 2, self.SIZE - 9, self.SIZE - 9)
-
-        painter.setBrush(QColor(255, 255, 255, 11))
-        painter.drawEllipse(16, 10, self.SIZE - 41, self.SIZE - 50)
-
-    def remember_foreground_window(self):
-        hwnd = GetForegroundWindow()
-        if hwnd and int(hwnd) != int(self.winId()):
-            self.last_external_window = hwnd
-
-    def capture_page(self):
-        target = self.last_external_window
-
-        if not target:
-            QMessageBox.warning(
-                self,
-                APP_NAME,
-                "没有找到刚才使用的窗口。\n请先点击浏览器页面，再点击“截取页面”。"
+            self.root.after(
+                0,
+                lambda: self._ble_failed("发现接收端，但连接失败。")
             )
             return
 
-        self.hide()
-        QApplication.processEvents()
+        self.ble_client = client
+        self.ble_device = target_device
 
-        SetForegroundWindow(target)
-        time.sleep(0.18)
-        press_ctrl_p()
-        time.sleep(0.35)
-
-        self.show()
-        self.raise_()
-
-    def choose_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择要发送到 iPad 的文件",
-            "",
-            "所有文件 (*.*)",
+        self.root.after(
+            0,
+            lambda: self._ble_connected(target_device.name or "iPad")
         )
 
-        if not file_path:
-            return False
-
-        self.set_pending_file(Path(file_path))
-        return True
-
-    def set_pending_file(self, file_path):
-        if not file_path.exists() or not file_path.is_file():
-            QMessageBox.warning(self, APP_NAME, "选择的文件不存在。")
-            return
-
-        self.pending_file = file_path
-        self.send_btn.setToolTip(str(file_path))
-
-    def dragEnterEvent(self, event):
-        urls = event.mimeData().urls()
-        if any(url.isLocalFile() for url in urls):
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        local_files = [
-            Path(url.toLocalFile())
-            for url in event.mimeData().urls()
-            if url.isLocalFile()
-        ]
-
-        local_files = [p for p in local_files if p.is_file()]
-
-        if not local_files:
-            return
-
-        self.set_pending_file(local_files[0])
-
-        QMessageBox.information(
-            self,
+    def _ble_connected(self, device_name):
+        self.scanning = False
+        self.connect_btn.config(
+            text="iPad 已连接",
+            state="normal"
+        )
+        messagebox.showinfo(
             APP_NAME,
-            "已选择：\n{}\n\n点击“发送文件”即可发送。".format(local_files[0].name)
+            "已连接：{}".format(device_name)
         )
 
-        event.acceptProposedAction()
+    def _ble_failed(self, message):
+        self.scanning = False
+        self.connect_btn.config(
+            text="连接 iPad",
+            state="normal"
+        )
+        messagebox.showinfo(
+            "连接 iPad",
+            message
+        )
 
-    def connect_ipad(self):
-        if self.bluetooth.is_connected:
-            QMessageBox.information(self, APP_NAME, "iPad 已经连接。")
-            return
-
-        self.connect_btn.setText("搜索中…")
-        self.connect_btn.setEnabled(False)
-        self.bluetooth.scan_and_connect()
-
-    def on_bt_status(self, text):
-        self.connect_btn.setText(text)
-
-    def on_bt_connected(self, device_name):
-        self.connect_btn.setEnabled(True)
-        self.connect_btn.setText("iPad 已连接")
-        self.connect_btn.setToolTip(device_name)
-
-    def on_bt_failed(self, message):
-        self.connect_btn.setEnabled(True)
-        self.connect_btn.setText("连接 iPad")
-        QMessageBox.information(self, "连接 iPad", message)
+    # -------------------------------------------------------------------------
+    # Send
+    # -------------------------------------------------------------------------
 
     def choose_or_send_file(self):
         if self.pending_file is None:
             if not self.choose_file():
                 return
 
-        if not self.bluetooth.is_connected:
-            QMessageBox.information(
-                self,
+        self.send_pending_file()
+
+    def send_pending_file(self):
+        if self.pending_file is None:
+            return
+
+        connected = False
+
+        if self.ble_client is not None:
+            try:
+                connected = bool(self.ble_client.is_connected)
+            except Exception:
+                connected = False
+
+        if not connected:
+            messagebox.showinfo(
                 "发送文件",
-                "已选择文件：\n{}\n\n"
+                "待发送文件：\n{}\n\n"
                 "尚未连接 iPad。\n"
-                "请先点击“连接 iPad”。".format(self.pending_file.name)
+                "请先点击“连接 iPad”。".format(
+                    self.pending_file.name
+                )
             )
             return
 
-        QMessageBox.information(
-            self,
+        messagebox.showinfo(
             "发送文件",
             "准备发送：\n{}\n\n"
-            "实际文件传输会在 iPad 接收端完成后启用。".format(self.pending_file.name)
+            "实际文件字节传输将在 iPad 接收端完成后启用。".format(
+                self.pending_file.name
+            )
         )
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            child = self.childAt(event.position().toPoint())
-            if not isinstance(child, QPushButton):
-                self.dragging = True
-                self.drag_origin = event.globalPosition().toPoint()
-                self.window_origin = self.pos()
-                event.accept()
-
-    def mouseMoveEvent(self, event):
-        if self.dragging and (event.buttons() & Qt.LeftButton):
-            delta = event.globalPosition().toPoint() - self.drag_origin
-            self.move(self.window_origin + delta)
-            event.accept()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.dragging = False
-            event.accept()
-
-
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-
-    ball = FloatingBall()
-
-    screen = app.primaryScreen().availableGeometry()
-    x = screen.right() - FloatingBall.SIZE - 35
-    y = screen.center().y() - FloatingBall.SIZE // 2
-    ball.move(x, y)
-
-    ball.show()
-    ball.raise_()
-
-    sys.exit(app.exec())
+    def run(self):
+        self.root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    app = FloatingBall()
+    app.run()
