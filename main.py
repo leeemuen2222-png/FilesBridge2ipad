@@ -5,10 +5,11 @@ import ctypes
 import asyncio
 import threading
 from pathlib import Path
+from typing import Optional
 from ctypes import wintypes
 
 from PySide6.QtCore import Qt, QPoint, QTimer, Signal, QObject
-from PySide6.QtGui import QPainter, QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QPainter, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -21,8 +22,10 @@ from PySide6.QtWidgets import (
 try:
     from bleak import BleakScanner, BleakClient
     BLE_AVAILABLE = True
-except Exception:
+    BLE_IMPORT_ERROR = ""
+except Exception as exc:
     BLE_AVAILABLE = False
+    BLE_IMPORT_ERROR = str(exc)
 
 
 APP_NAME = "FilesBridge2ipad"
@@ -59,8 +62,6 @@ def press_ctrl_p():
 # -----------------------------------------------------------------------------
 
 FILES_BRIDGE_SERVICE_UUID = "7f7d0001-5a10-4c91-9b1a-6ab31d8a1001"
-CONTROL_CHAR_UUID = "7f7d0002-5a10-4c91-9b1a-6ab31d8a1001"
-DATA_CHAR_UUID = "7f7d0003-5a10-4c91-9b1a-6ab31d8a1001"
 
 
 class BluetoothSignals(QObject):
@@ -78,13 +79,17 @@ class BluetoothManager:
 
     @property
     def is_connected(self):
-        return bool(self.client and self.client.is_connected)
+        try:
+            return bool(self.client and self.client.is_connected)
+        except Exception:
+            return False
 
     def scan_and_connect(self):
         if not BLE_AVAILABLE:
-            self.signals.failed.emit(
-                "缺少 Bluetooth 组件 bleak。\n请重新运行 run.bat 安装依赖。"
-            )
+            message = "Bluetooth 组件 bleak 无法加载。"
+            if BLE_IMPORT_ERROR:
+                message += "\n\n错误信息：\n" + BLE_IMPORT_ERROR
+            self.signals.failed.emit(message)
             return
 
         if self._thread and self._thread.is_alive():
@@ -100,7 +105,7 @@ class BluetoothManager:
         try:
             asyncio.run(self._scan_and_connect_async())
         except Exception as exc:
-            self.signals.failed.emit(f"蓝牙连接失败：{exc}")
+            self.signals.failed.emit("蓝牙连接失败：{}".format(exc))
 
     async def _scan_and_connect_async(self):
         self.signals.status.emit("搜索 iPad…")
@@ -118,11 +123,12 @@ class BluetoothManager:
         if target_device is None:
             self.signals.failed.emit(
                 "未找到 FilesBridge2ipad 接收端。\n\n"
-                "目前还没有 iPad 端 App，因此这是预期结果。"
+                "目前还没有 iPad 端 App，因此这是正常结果。"
             )
             return
 
         self.signals.status.emit("正在连接…")
+
         client = BleakClient(target_device)
         await client.connect(timeout=10.0)
 
@@ -145,9 +151,7 @@ class FloatingBall(QWidget):
         self.drag_origin = QPoint()
         self.window_origin = QPoint()
         self.dragging = False
-
-        # The file currently queued for sending.
-        self.pending_file: Path | None = None
+        self.pending_file = None  # type: Optional[Path]
 
         self.bluetooth = BluetoothManager()
         self.bluetooth.signals.status.connect(self.on_bt_status)
@@ -207,10 +211,6 @@ class FloatingBall(QWidget):
         self.foreground_timer.timeout.connect(self.remember_foreground_window)
         self.foreground_timer.start(150)
 
-    # -------------------------------------------------------------------------
-    # Appearance
-    # -------------------------------------------------------------------------
-
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -225,10 +225,6 @@ class FloatingBall(QWidget):
         painter.setBrush(QColor(255, 255, 255, 11))
         painter.drawEllipse(16, 10, self.SIZE - 41, self.SIZE - 50)
 
-    # -------------------------------------------------------------------------
-    # Foreground window tracking / browser print
-    # -------------------------------------------------------------------------
-
     def remember_foreground_window(self):
         hwnd = GetForegroundWindow()
         if hwnd and int(hwnd) != int(self.winId()):
@@ -236,11 +232,12 @@ class FloatingBall(QWidget):
 
     def capture_page(self):
         target = self.last_external_window
+
         if not target:
             QMessageBox.warning(
                 self,
                 APP_NAME,
-                "没有找到刚才使用的窗口。\n请先点击浏览器页面，再点击“截取页面”。",
+                "没有找到刚才使用的窗口。\n请先点击浏览器页面，再点击“截取页面”。"
             )
             return
 
@@ -254,10 +251,6 @@ class FloatingBall(QWidget):
 
         self.show()
         self.raise_()
-
-    # -------------------------------------------------------------------------
-    # File selection / drag and drop
-    # -------------------------------------------------------------------------
 
     def choose_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -273,21 +266,20 @@ class FloatingBall(QWidget):
         self.set_pending_file(Path(file_path))
         return True
 
-    def set_pending_file(self, file_path: Path):
+    def set_pending_file(self, file_path):
         if not file_path.exists() or not file_path.is_file():
             QMessageBox.warning(self, APP_NAME, "选择的文件不存在。")
             return
 
         self.pending_file = file_path
-        self.send_btn.setText("发送文件")
         self.send_btn.setToolTip(str(file_path))
 
-    def dragEnterEvent(self, event: QDragEnterEvent):
+    def dragEnterEvent(self, event):
         urls = event.mimeData().urls()
         if any(url.isLocalFile() for url in urls):
             event.acceptProposedAction()
 
-    def dropEvent(self, event: QDropEvent):
+    def dropEvent(self, event):
         local_files = [
             Path(url.toLocalFile())
             for url in event.mimeData().urls()
@@ -299,19 +291,15 @@ class FloatingBall(QWidget):
         if not local_files:
             return
 
-        # v0.3 queues the first dropped file.
         self.set_pending_file(local_files[0])
 
         QMessageBox.information(
             self,
             APP_NAME,
-            f"已选择：\n{local_files[0].name}\n\n点击“发送文件”即可发送。",
+            "已选择：\n{}\n\n点击“发送文件”即可发送。".format(local_files[0].name)
         )
-        event.acceptProposedAction()
 
-    # -------------------------------------------------------------------------
-    # Bluetooth
-    # -------------------------------------------------------------------------
+        event.acceptProposedAction()
 
     def connect_ipad(self):
         if self.bluetooth.is_connected:
@@ -335,12 +323,7 @@ class FloatingBall(QWidget):
         self.connect_btn.setText("连接 iPad")
         QMessageBox.information(self, "连接 iPad", message)
 
-    # -------------------------------------------------------------------------
-    # Send workflow
-    # -------------------------------------------------------------------------
-
     def choose_or_send_file(self):
-        # If no file is queued, pressing Send directly opens the file picker.
         if self.pending_file is None:
             if not self.choose_file():
                 return
@@ -349,29 +332,18 @@ class FloatingBall(QWidget):
             QMessageBox.information(
                 self,
                 "发送文件",
-                f"已选择文件：\n{self.pending_file.name}\n\n"
+                "已选择文件：\n{}\n\n"
                 "尚未连接 iPad。\n"
-                "请先点击“连接 iPad”。\n\n"
-                "目前 iPad 接收端尚未制作，所以暂时不能完成实际传输。",
+                "请先点击“连接 iPad”。".format(self.pending_file.name)
             )
             return
 
-        # Future implementation point:
-        # 1. Send file metadata over CONTROL_CHAR_UUID
-        # 2. Chunk bytes over DATA_CHAR_UUID
-        # 3. iPad app reconstructs file
-        # 4. iPad invokes system Share Sheet
         QMessageBox.information(
             self,
             "发送文件",
-            f"准备发送：\n{self.pending_file.name}\n\n"
-            "蓝牙通道已经建立。\n"
-            "实际文件字节传输将在 iPad 接收端完成后启用。",
+            "准备发送：\n{}\n\n"
+            "实际文件传输会在 iPad 接收端完成后启用。".format(self.pending_file.name)
         )
-
-    # -------------------------------------------------------------------------
-    # Drag orb itself
-    # -------------------------------------------------------------------------
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -406,6 +378,8 @@ def main():
     ball.move(x, y)
 
     ball.show()
+    ball.raise_()
+
     sys.exit(app.exec())
 
 
